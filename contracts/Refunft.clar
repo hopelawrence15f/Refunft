@@ -9,6 +9,9 @@
 (define-constant ERR_ACCESS_DENIED (err u107))
 (define-constant ERR_SERVICE_ALREADY_EXISTS (err u108))
 (define-constant ERR_INVALID_SERVICE_DATA (err u109))
+(define-constant ERR_DOCUMENT_NOT_FOUND (err u110))
+(define-constant ERR_DOCUMENT_EXPIRED (err u111))
+(define-constant ERR_INVALID_DOCUMENT_DATA (err u112))
 
 (define-non-fungible-token refugee-id uint)
 
@@ -16,6 +19,7 @@
 (define-data-var contract-paused bool false)
 (define-data-var last-service-id uint u0)
 (define-data-var last-access-id uint u0)
+(define-data-var last-document-id uint u0)
 
 (define-map refugee-profiles
   uint
@@ -104,6 +108,50 @@
     last-access: uint,
     total-duration: uint,
     last-notes: (string-ascii 500)
+  }
+)
+
+;; Document attachment system
+(define-map document-registry
+  uint
+  {
+    token-id: uint,
+    document-type: (string-ascii 50),
+    document-name: (string-ascii 100),
+    document-hash: (string-ascii 64),
+    issuer-name: (string-ascii 100),
+    issue-date: uint,
+    expiry-date: (optional uint),
+    verification-status: (string-ascii 20),
+    verified-by: (optional principal),
+    verified-at: (optional uint),
+    is-sensitive: bool,
+    notes: (string-ascii 300),
+    uploaded-by: principal,
+    created-at: uint
+  }
+)
+
+(define-map document-verifiers principal bool)
+
+(define-map token-documents
+  uint
+  {
+    document-count: uint,
+    verified-count: uint,
+    expired-count: uint,
+    last-document-added: uint
+  }
+)
+
+(define-map document-access-log
+  uint
+  {
+    document-id: uint,
+    accessed-by: principal,
+    access-purpose: (string-ascii 100),
+    access-granted: bool,
+    accessed-at: uint
   }
 )
 
@@ -396,6 +444,175 @@
   )
 )
 
+;; Document management functions
+(define-public (add-document-verifier (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (ok (map-set document-verifiers verifier true))
+  )
+)
+
+(define-public (remove-document-verifier (verifier principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (ok (map-delete document-verifiers verifier))
+  )
+)
+
+(define-public (attach-document
+  (token-id uint)
+  (document-type (string-ascii 50))
+  (document-name (string-ascii 100))
+  (document-hash (string-ascii 64))
+  (issuer-name (string-ascii 100))
+  (issue-date uint)
+  (expiry-date (optional uint))
+  (is-sensitive bool)
+  (notes (string-ascii 300))
+)
+  (let
+    (
+      (document-id (+ (var-get last-document-id) u1))
+      (token-owner (unwrap! (nft-get-owner? refugee-id token-id) ERR_NOT_FOUND))
+      (token-docs (default-to {document-count: u0, verified-count: u0, expired-count: u0, last-document-added: u0}
+                               (map-get? token-documents token-id)))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_NOT_OWNER)
+    (asserts! (> (len document-type) u0) ERR_INVALID_DOCUMENT_DATA)
+    (asserts! (> (len document-name) u0) ERR_INVALID_DOCUMENT_DATA)
+    (asserts! (> (len document-hash) u0) ERR_INVALID_DOCUMENT_DATA)
+    (asserts! (> (len issuer-name) u0) ERR_INVALID_DOCUMENT_DATA)
+    (asserts! (> issue-date u0) ERR_INVALID_DOCUMENT_DATA)
+    
+    (map-set document-registry document-id {
+      token-id: token-id,
+      document-type: document-type,
+      document-name: document-name,
+      document-hash: document-hash,
+      issuer-name: issuer-name,
+      issue-date: issue-date,
+      expiry-date: expiry-date,
+      verification-status: "pending",
+      verified-by: none,
+      verified-at: none,
+      is-sensitive: is-sensitive,
+      notes: notes,
+      uploaded-by: tx-sender,
+      created-at: stacks-block-height
+    })
+    
+    (map-set token-documents token-id {
+      document-count: (+ (get document-count token-docs) u1),
+      verified-count: (get verified-count token-docs),
+      expired-count: (get expired-count token-docs),
+      last-document-added: stacks-block-height
+    })
+    
+    (var-set last-document-id document-id)
+    (ok document-id)
+  )
+)
+
+(define-public (verify-document (document-id uint) (verification-status (string-ascii 20)))
+  (let
+    (
+      (document (unwrap! (map-get? document-registry document-id) ERR_DOCUMENT_NOT_FOUND))
+      (is-authorized-verifier (default-to false (map-get? document-verifiers tx-sender)))
+      (token-docs (default-to {document-count: u0, verified-count: u0, expired-count: u0, last-document-added: u0}
+                               (map-get? token-documents (get token-id document))))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) is-authorized-verifier) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len verification-status) u0) ERR_INVALID_DOCUMENT_DATA)
+    
+    (map-set document-registry document-id (merge document {
+      verification-status: verification-status,
+      verified-by: (some tx-sender),
+      verified-at: (some stacks-block-height)
+    }))
+    
+    (if (is-eq verification-status "verified")
+      (map-set token-documents (get token-id document) (merge token-docs {
+        verified-count: (+ (get verified-count token-docs) u1)
+      }))
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (request-document-access 
+  (document-id uint) 
+  (access-purpose (string-ascii 100))
+)
+  (let
+    (
+      (document (unwrap! (map-get? document-registry document-id) ERR_DOCUMENT_NOT_FOUND))
+      (token-owner (unwrap! (nft-get-owner? refugee-id (get token-id document)) ERR_NOT_FOUND))
+      (is-authorized-verifier (default-to false (map-get? document-verifiers tx-sender)))
+      (is-authorized-provider (default-to false (map-get? service-providers tx-sender)))
+      (access-granted (or (is-eq tx-sender token-owner) 
+                         (and (not (get is-sensitive document)) 
+                              (or is-authorized-verifier is-authorized-provider))))
+    )
+    (asserts! (> (len access-purpose) u0) ERR_INVALID_DOCUMENT_DATA)
+    
+    (map-set document-access-log document-id {
+      document-id: document-id,
+      accessed-by: tx-sender,
+      access-purpose: access-purpose,
+      access-granted: access-granted,
+      accessed-at: stacks-block-height
+    })
+    
+    (if access-granted
+      (ok document)
+      ERR_ACCESS_DENIED
+    )
+  )
+)
+
+(define-public (update-document-expiry (document-id uint) (new-expiry-date (optional uint)))
+  (let
+    (
+      (document (unwrap! (map-get? document-registry document-id) ERR_DOCUMENT_NOT_FOUND))
+      (token-owner (unwrap! (nft-get-owner? refugee-id (get token-id document)) ERR_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender token-owner) ERR_NOT_OWNER)
+    
+    (map-set document-registry document-id (merge document {
+      expiry-date: new-expiry-date
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (mark-document-expired (document-id uint))
+  (let
+    (
+      (document (unwrap! (map-get? document-registry document-id) ERR_DOCUMENT_NOT_FOUND))
+      (is-authorized-verifier (default-to false (map-get? document-verifiers tx-sender)))
+      (token-docs (default-to {document-count: u0, verified-count: u0, expired-count: u0, last-document-added: u0}
+                               (map-get? token-documents (get token-id document))))
+      (current-expiry (get expiry-date document))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) is-authorized-verifier) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some current-expiry) ERR_INVALID_DOCUMENT_DATA)
+    (asserts! (<= (unwrap-panic current-expiry) stacks-block-height) ERR_INVALID_DOCUMENT_DATA)
+    
+    (map-set document-registry document-id (merge document {
+      verification-status: "expired"
+    }))
+    
+    (map-set token-documents (get token-id document) (merge token-docs {
+      expired-count: (+ (get expired-count token-docs) u1)
+    }))
+    
+    (ok true)
+  )
+)
+
 ;; (define-public (transfer (token-id uint) (sender principal) (recipient principal))
 ;;   (begin
 ;;     (asserts! false ERR_TRANSFER_DISABLED)
@@ -502,4 +719,58 @@
   )
 )
 
+;; Document read-only functions
+(define-read-only (get-document (document-id uint))
+  (map-get? document-registry document-id)
+)
+
+(define-read-only (get-token-documents-summary (token-id uint))
+  (map-get? token-documents token-id)
+)
+
+(define-read-only (is-document-verifier (verifier principal))
+  (default-to false (map-get? document-verifiers verifier))
+)
+
+(define-read-only (get-document-access-log (document-id uint))
+  (map-get? document-access-log document-id)
+)
+
+(define-read-only (get-last-document-id)
+  (ok (var-get last-document-id))
+)
+
+(define-read-only (check-document-validity (document-id uint))
+  (let
+    (
+      (document (map-get? document-registry document-id))
+    )
+    (match document
+      doc-data (let
+        (
+          (expiry (get expiry-date doc-data))
+          (is-verified (is-eq (get verification-status doc-data) "verified"))
+          (is-expired (match expiry
+                        exp-date (<= exp-date stacks-block-height)
+                        false))
+        )
+        (ok {
+          exists: true,
+          verified: is-verified,
+          expired: is-expired,
+          status: (get verification-status doc-data)
+        })
+      )
+      (ok {
+        exists: false,
+        verified: false,
+        expired: false,
+        status: "not-found"
+      })
+    )
+  )
+)
+
 (map-set authorized-issuers CONTRACT_OWNER true)
+
+
